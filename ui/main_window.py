@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QPushButton, QTextEdit,
-                           QHBoxLayout, QVBoxLayout, QFileDialog, QLabel,
-                           QMessageBox, QGroupBox, QGridLayout, QSpinBox,
-                           QDoubleSpinBox, QComboBox)
+                             QHBoxLayout, QVBoxLayout, QFileDialog, QLabel,
+                             QMessageBox, QGroupBox, QGridLayout, QSpinBox,
+                             QDoubleSpinBox, QComboBox, QProgressBar)
 from PyQt6.QtCore import Qt, pyqtSignal
 import os
 import torch
@@ -10,6 +10,7 @@ from core.trainer import TrainThread
 from core.validator import ValidatorThread
 import shutil
 import yaml
+import threading
 
 class MainWindow(QMainWindow):
     progress_signal = pyqtSignal(str, str)
@@ -33,14 +34,23 @@ class MainWindow(QMainWindow):
         # 创建左侧布局
         left_widget = self.create_left_panel()
         
-        # 建右侧显示区域
+        # 创建右侧显示区域
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         
         # 添加状态显示标签
         self.status_label = QLabel("就绪")
         right_layout.addWidget(self.status_label)
-        
+
+        # 添加进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        right_layout.addWidget(self.progress_bar)
+
+        # 添加当前处理图片信息的文本框
+        self.current_image_label = QLabel("当前处理图片: ")
+        right_layout.addWidget(self.current_image_label)
+
         # 添加到主布局
         main_layout.addWidget(left_widget)
         main_layout.addWidget(right_widget)
@@ -51,6 +61,9 @@ class MainWindow(QMainWindow):
         self.statusBar = self.statusBar()
         self.progress_label = QLabel()
         self.statusBar.addWidget(self.progress_label)
+
+        # 初始化控件状态
+        self.set_controls_enabled(1)  # 只启用选择文件夹的控件
 
     def create_left_panel(self):
         """创建左侧面板"""
@@ -71,8 +84,8 @@ class MainWindow(QMainWindow):
         file_select_layout.addWidget(self.select_folder_btn)
         file_select_layout.addWidget(self.path_text)
 
-        # 择区域
-        model_group = QGroupBox("模置")
+        # 模型设置区域
+        model_group = QGroupBox("模型")
         model_layout = QGridLayout()
         
         model_layout.addWidget(QLabel("模型大小:"), 0, 0)
@@ -159,7 +172,7 @@ class MainWindow(QMainWindow):
             try:
                 # 检查jpg图片
                 image_files = [f for f in os.listdir(folder_path) 
-                             if f.lower().endswith('.jpg')]
+                               if f.lower().endswith('.jpg')]
                 
                 if not image_files:
                     QMessageBox.warning(self, "警告", "所选文件夹中没有jpg图片！")
@@ -168,6 +181,9 @@ class MainWindow(QMainWindow):
                 # 更新路径显示
                 self.path_text.setText(folder_path)
                 self.folders = {'base': folder_path}
+                
+                # 启用模型设置区域的控件
+                self.set_controls_enabled(2)  # 启用模型设置区域的控件
                 
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"检查文件夹失败: {str(e)}")
@@ -190,12 +206,12 @@ class MainWindow(QMainWindow):
                           if f.lower().endswith('.jpg')]
             for image_file in image_files:
                 src = os.path.join(self.folders['base'], image_file)
-                dst = os.path.join(self.folders['raw'], image_file)
-                shutil.copy(src, dst)
+                dst_raw = os.path.join(self.folders['raw'], image_file)
+                shutil.copy(src, dst_raw)  # 复制到raw文件夹
             
             # 创建处理器实例
             model_size = self.model_size_combo.currentText()
-            self.processor = ImageProcessor(model_size=model_size, progress_signal=self.progress_signal)
+            self.processor = ImageProcessor(model_size=model_size, folders=self.folders, progress_signal=self.progress_signal)
             
             # 禁用按钮
             self.select_folder_btn.setEnabled(False)
@@ -203,12 +219,17 @@ class MainWindow(QMainWindow):
             self.model_size_combo.setEnabled(False)
             
             # 开始处理文件夹里的所有图片
-            self.processor.process_folder(self.folders)
+            self.processor.process_folder()  # 直接调用处理方法
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"处理失败: {str(e)}")
         finally:
             self.enable_buttons()
+
+    def process_images(self):
+        """后台处理图片"""
+        self.processor.process_folder(self.folders)  # 传递文件夹字典
+        self.progress_signal.emit("success", "所有图片处理完成！")
 
     def handle_progress(self, msg_type, message):
         """处理进度信息"""
@@ -219,7 +240,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "成功", message)
             self.enable_buttons()
         else:
-            self.progress_label.setText(message)
+            self.progress_label.setText(message)  # 更新进度信息
+            # 解析进度信息以更新进度条
+            if "已处理" in message:
+                progress_percentage = int(message.split(' ')[-1][:-1])  # 提取百分比
+                self.progress_bar.setValue(progress_percentage)  # 更新进度条
+                self.current_image_label.setText(message)  # 更新当前处理图片信息
             self.statusBar.repaint()
 
     def start_training(self):
@@ -252,8 +278,9 @@ class MainWindow(QMainWindow):
             self.train_thread.finished_signal.connect(self.start_validation)
 
             # 禁用按钮
-            self.train_btn.setEnabled(False)
-            self.start_btn.setEnabled(False)
+            # self.train_btn.setEnabled(False)
+            # self.start_btn.setEnabled(False)
+            # self.set_controls_enabled(3)
 
             # 开始训练
             self.train_thread.start()
@@ -265,10 +292,10 @@ class MainWindow(QMainWindow):
     def start_validation(self, model_path):
         """开始验证"""
         try:
-            # 创建验证结果保存目录
+            # 创建验结果保存目录
             save_folder = os.path.join(self.folders['base'], 'validation_results')
             
-            # 创建验证线程
+            # 创建验证程
             self.validator_thread = ValidatorThread(
                 model_path=model_path,
                 test_folder=self.folders['test'],
@@ -302,3 +329,33 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"删除文件夹时出错: {str(e)}")
             event.ignore()  # 阻止窗口关闭，直到错误被解决
+
+    def set_controls_enabled(self, step):
+        """根据步骤禁用或启用控件"""
+        if step == 1:  # 选择文件夹
+            self.select_folder_btn.setEnabled(True)
+            self.start_btn.setEnabled(False)
+            self.model_size_combo.setEnabled(False)
+            self.train_btn.setEnabled(False)
+            self.conf_spin.setEnabled(False)
+            self.imgsz_spin.setEnabled(False)
+            self.epochs_spin.setEnabled(False)
+            self.device_combo.setEnabled(False)
+        elif step == 2:  # 标定
+            self.select_folder_btn.setEnabled(True)
+            self.start_btn.setEnabled(True)
+            self.model_size_combo.setEnabled(True)
+            self.train_btn.setEnabled(False)
+            self.conf_spin.setEnabled(False)
+            self.imgsz_spin.setEnabled(False)
+            self.epochs_spin.setEnabled(False)
+            self.device_combo.setEnabled(False)
+        elif step == 3:  # 训练
+            self.select_folder_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.model_size_combo.setEnabled(False)
+            self.train_btn.setEnabled(True)
+            self.conf_spin.setEnabled(True)
+            self.imgsz_spin.setEnabled(True)
+            self.epochs_spin.setEnabled(True)
+            self.device_combo.setEnabled(False)

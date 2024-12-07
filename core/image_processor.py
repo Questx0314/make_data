@@ -4,12 +4,11 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from queue import Queue
-import threading 
 import sys
 import shutil
 from core.data_processor import DataProcessor
-
+from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtWidgets import QMessageBox
 
 # 添加SAM2包的路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,36 +34,37 @@ class ImageProcessor:
         }
     }
 
-    def __init__(self, model_size='Large', progress_signal=None):
-        # 初始化设备
+    def __init__(self, model_size='Large', folders=None, progress_signal=None):
+        self.device = self._initialize_device()
+        self.sam2, self.mask_generator = self._initialize_model(model_size)
+        self.progress_signal = progress_signal  # 用于进度更新的信号
+        self.folders = folders  # 存储文件夹路径
+        self.image_files = []  # 存储待处理的图片文件
+        self.bounding_boxes = []  # 存储每张图片的边界框
+
+    def _initialize_device(self):
+        """初始化设备"""
         if torch.cuda.is_available():
-            self.device = torch.device("cuda")
+            return torch.device("cuda")
         elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
+            return torch.device("mps")
         else:
-            self.device = torch.device("cpu")
-            
-        # 获取模型配置
+            return torch.device("cpu")
+
+    def _initialize_model(self, model_size):
+        """初始化SAM模型和掩码生成器"""
         model_config = self.MODEL_CONFIGS[model_size]
-        
-        # 构建模型路径
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.sam2_checkpoint = os.path.join(
+        sam2_checkpoint = os.path.join(
             project_root, 'models', 'checkpoints', 
             model_config['checkpoint']
         )
-        self.model_cfg = os.path.join(
+        model_cfg = os.path.join(
             project_root, 'models', 'configs', 'sam2.1',
             model_config['config']
         )
-        
-        # 初始化SAM2模型
-        self.sam2 = build_sam2(self.model_cfg, self.sam2_checkpoint, 
-                              device=self.device, apply_postprocessing=False)
-        
-        # 初始化mask生成器
-        self.mask_generator = SAM2AutomaticMaskGenerator(
-            model=self.sam2,
+        sam2 = build_sam2(model_cfg, sam2_checkpoint, device=self.device, apply_postprocessing=False)
+        mask_generator = SAM2AutomaticMaskGenerator(
+            model=sam2,
             points_per_side=16,
             points_per_batch=64,
             pred_iou_thresh=0.9,
@@ -73,99 +73,53 @@ class ImageProcessor:
             box_nms_thresh=0.7,
             use_m2m=True
         )
+        return sam2, mask_generator
 
-        self.progress_signal = progress_signal  # 用于进度更新的信号
-        # 初始化信号量
-        self.semaphore = threading.Semaphore(0)
-        self.current_image_index = 0  # 当前处理的图片索引
-        self.image_files = []  # 存储待处理的图片文件
-        self.folders = None
-
-    def process_folder(self, folders):
+    def process_folder(self):
         """处理文件夹中的所有图片"""
-        raw_folder = folders['raw']
-        images_dir = folders['images']
-        labels_dir = folders['labels']
-        test_dir = folders['test']
-        self.folders = folders
-
+        raw_folder = self.folders['raw']
         self.image_files = [f for f in os.listdir(raw_folder) 
                             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
         
         if not self.image_files:
             raise ValueError("所选文件夹中没有图片文件！")
 
-        # 处理每张图片
-        for image_file in self.image_files:
-            image_path = os.path.join(raw_folder, image_file)
-            print(f"处理图片: {image_path}")
-            
-            # 读取并处理图片
-            image = cv2.imread(image_path)
-            image = cv2.resize(image, (1920, 1080))
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # 创建处理线程
+        self.processing_thread = ImageProcessingThread(self.image_files, self.mask_generator, self.folders)
+        self.processing_thread.progress_signal.connect(self.handle_progress)
+        self.processing_thread.start()
 
-            # 生成掩码和边界框
-            masks = self.mask_generator.generate(image_rgb)
-            bounding_boxes = []
-            for mask in masks:
-                mask_np = mask["segmentation"]
-                x, y, w, h = cv2.boundingRect(mask_np.astype(np.uint8))
-                bounding_boxes.append((x, y, x + w, y + h))
+    def handle_progress(self, msg_type, message):
+        """处理进度信息"""
+        if msg_type == "error":
+            QMessageBox.critical(self, "错误", message)
+            self.enable_buttons()
+        elif msg_type == "success":
+            QMessageBox.information(self, "成功", message)
+            # 这里可以选择不调用交互标注
+            # self.start_interactive_annotation()  # 开始交互标注
+        else:
+            self.progress_signal.emit("info", message)  # 发送进度信息
 
-            # 进行交互式标注
-            self._interactive_annotation(image_path, image_rgb, bounding_boxes,
-                                        images_dir, labels_dir, test_dir, raw_folder)
+    def start_interactive_annotation(self):
+        """开始交互式标注"""
+        # 注释掉交互标注的代码
+        # for image_file, bounding_boxes in self.bounding_boxes:
+        #     image_path = os.path.join(self.folders['raw'], image_file)
+        #     image = cv2.imread(image_path)
+        #     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-            # 从raw文件夹中移除已处理的图片
-            os.remove(image_path)
+        #     # 更新当前处理图片信息
+        #     if self.progress_signal:
+        #         self.progress_signal.emit("info", f"当前处理图片: {image_file}")
 
-        # 所有图片标注完成，释放信号量，开始数据增强
-        self.start_data_augmentation(images_dir, labels_dir)
+        #     # 进行交互式标注
+        #     self._interactive_annotation(image_path, image_rgb, bounding_boxes,
+        #                                 self.folders['images'], self.folders['labels'], 
+        #                                 self.folders['test'], self.folders['raw'])
 
-    def process_single_image(self, raw_folder, images_dir, labels_dir, test_dir):
-        """处理单张图片"""
-        if self.current_image_index >= len(self.image_files):
-            # 所有图片处理完成，释放信号量
-            self.semaphore.release()
-            return
-
-        image_file = self.image_files[self.current_image_index]
-        image_path = os.path.join(raw_folder, image_file)
-        print(f"处理图片: {image_path}")
-        
-        # 读取并处理图片
-        image = cv2.imread(image_path)
-        image = cv2.resize(image, (1920, 1080))
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # 生成掩码和边界框
-        masks = self.mask_generator.generate(image_rgb)
-        bounding_boxes = []
-        for mask in masks:
-            mask_np = mask["segmentation"]
-            x, y, w, h = cv2.boundingRect(mask_np.astype(np.uint8))
-            bounding_boxes.append((x, y, x + w, y + h))
-
-        # 进行交互式标注
-        self._interactive_annotation(image_path, image_rgb, bounding_boxes,
-                                    images_dir, labels_dir, test_dir, raw_folder)
-
-        # 从raw文件夹中移除已处理的图片
-        os.remove(image_path)
-
-        # 更新当前图片索引并处理下一张
-        self.current_image_index += 1
-        self.process_single_image(raw_folder, images_dir, labels_dir, test_dir)
-
-    def start_data_augmentation(self, images_dir, labels_dir):
-        """开始数据增强"""
-        from core.data_processor import DataProcessor
-        data_processor = DataProcessor(self.folders, self.progress_signal)
-        if data_processor.process_data():
-            # 删除process文件夹
-            shutil.rmtree(self.folders['process'])
-            self.progress_signal.emit("success", "处理完成！")
+        # 所有图片标注完成，开始数据增强
+        self.start_data_augmentation(self.folders['images'], self.folders['labels'])
 
     def _interactive_annotation(self, image_path, image_rgb, bounding_boxes,
                               images_dir, labels_dir, test_dir, raw_folder):
@@ -270,9 +224,6 @@ class ImageProcessor:
                                                        os.path.splitext(os.path.basename(image_path))[0] + ".txt")
                         self._save_yolo_labels(label_output_path, selected_boxes, image_rgb.shape[:2])
                     plt.close()
-                    
-                    # 释放信号量，表示当前图片处理完成
-                    self.semaphore.release()  # 释放信号量，表示当前图片处理完成
                 else:
                     preview_mode = True
                     draw_bounding_boxes()
@@ -284,8 +235,6 @@ class ImageProcessor:
                 test_path = os.path.join(test_dir, os.path.basename(image_path))
                 cv2.imwrite(test_path, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
                 plt.close()
-                # 释放信号量，表示当前图片处理完成
-                self.semaphore.release()
 
         # 创建图像窗口
         fig, ax = plt.subplots(figsize=(15, 10))
@@ -310,3 +259,54 @@ class ImageProcessor:
                 box_width = (x2 - x1) / w
                 box_height = (y2 - y1) / h
                 f.write(f"{class_id} {x_center} {y_center} {box_width} {box_height}\n")
+
+    def start_data_augmentation(self, images_dir, labels_dir):
+        """开始数据增强"""
+        from core.data_processor import DataProcessor
+        data_processor = DataProcessor(self.folders, self.progress_signal)
+        if data_processor.process_data():
+            # 删除process文件夹
+            shutil.rmtree(self.folders['process'])
+            # 删除临时文件夹
+            # shutil.rmtree(self.folders['temp'])
+            self.progress_signal.emit("success", "处理完成！")
+
+class ImageProcessingThread(QThread):
+    progress_signal = pyqtSignal(str, str)
+
+    def __init__(self, image_files, mask_generator, folders):
+        super().__init__()
+        self.image_files = image_files
+        self.mask_generator = mask_generator
+        self.folders = folders
+        self.bounding_boxes = []
+
+    def run(self):
+        total_images = len(self.image_files)
+
+        for idx, image_file in enumerate(self.image_files):
+            image_path = os.path.join(self.folders['raw'], image_file)
+            print(f"处理图片: {image_path}")
+
+            # 读取并处理图片
+            image = cv2.imread(image_path)
+            image = cv2.resize(image, (1920, 1080))
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # 生成掩码和边界框
+            masks = self.mask_generator.generate(image_rgb)
+            bounding_boxes = []
+            for mask in masks:
+                mask_np = mask["segmentation"]
+                x, y, w, h = cv2.boundingRect(mask_np.astype(np.uint8))
+                bounding_boxes.append((x, y, x + w, y + h))
+
+            # 将结果存储
+            self.bounding_boxes.append((image_file, bounding_boxes))
+
+            # 更新进度
+            progress_percentage = int((idx + 1) / total_images * 100)
+            self.progress_signal.emit("info", f"已处理 {idx + 1}/{total_images} 张图片 ({progress_percentage}%)")
+
+        # 所有图片处理完成
+        self.progress_signal.emit("success", "所有图片处理完成！")
